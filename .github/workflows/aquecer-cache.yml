@@ -1,0 +1,77 @@
+name: Aquecer cache do maremo.to
+
+on:
+  schedule:
+    # Duas vezes por dia: 06:17 e 18:17 no horario de Brasilia (09:17 e 21:17 UTC).
+    # O TTL do cache e de 7 dias, entao isso cobre a expiracao natural com folga;
+    # o resto e rede de seguranca para quando uma atualizacao de plugin purgar tudo.
+    - cron: '17 9,21 * * *'
+  workflow_dispatch:   # botao "Run workflow" para disparar na mao apos editar o site
+
+jobs:
+  aquecer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Visitar todas as paginas do sitemap
+        run: |
+          set -uo pipefail
+
+          BASE="https://maremo.to"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+          # O Accept precisa anunciar webp: o LiteSpeed guarda uma variante de cache
+          # diferente para quem aceita webp. Sem isso, aqueceriamos a variante errada.
+          ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+
+          echo "Lendo o sitemap..."
+          curl -sS -A "$UA" "$BASE/sitemap_index.xml" -o index.xml
+          grep -o '<loc>[^<]*</loc>' index.xml | sed 's|</\?loc>||g' > subsitemaps.txt
+
+          : > urls.txt
+          while read -r s; do
+            curl -sS -A "$UA" "$s" | grep -o '<loc>[^<]*</loc>' | sed 's|</\?loc>||g' >> urls.txt
+          done < subsitemaps.txt
+          sort -u urls.txt -o urls.txt
+          echo "$(wc -l < urls.txt) URLs encontradas."
+          echo
+
+          frias=0; total=0
+          : > relatorio.txt
+          while read -r u; do
+            total=$((total+1))
+            resp=$(curl -sS -o /dev/null -D - -A "$UA" -H "Accept: $ACCEPT" -w '|%{time_starttransfer}' --max-time 90 "$u")
+            estado=$(printf '%s' "$resp" | grep -i '^x-litespeed-cache:' | tr -d '\r' | awk '{print $2}')
+            tempo=$(printf '%s' "$resp" | tr -d '\n' | awk -F'|' '{print $NF}')
+            case "$estado" in
+              *miss*)
+                frias=$((frias+1)); marca="FRIA"
+                # So pausa depois de uma pagina fria, que custou CPU do servidor ao ser
+                # montada. Pagina ja quente sai do cache em 0,07s e nao pesa nada:
+                # esperar entre elas so faria a execucao custar mais minutos do GitHub.
+                sleep 2
+                ;;
+              *) marca="ok  " ;;
+            esac
+            printf '%s %7.2fs  %s\n' "$marca" "${tempo:-0}" "$u" >> relatorio.txt
+          done < urls.txt
+
+          echo "=== As mais lentas desta passada ==="
+          sort -k2 -rn relatorio.txt | head -10
+          echo
+          echo "Total: $total  |  Estavam frias: $frias"
+
+          {
+            echo "### Aquecimento do cache"
+            echo ""
+            echo "- Paginas verificadas: **$total**"
+            echo "- Estavam frias e foram aquecidas agora: **$frias**"
+            echo ""
+            if [ "$frias" -gt 0 ]; then
+              echo "Paginas que um visitante teria pego frias:"
+              echo ""
+              echo '```'
+              grep '^FRIA' relatorio.txt
+              echo '```'
+            else
+              echo "Site estava inteiro quente. Nenhum visitante pagaria pedagio."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

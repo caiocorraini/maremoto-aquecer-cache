@@ -1,0 +1,38 @@
+# Aquecedor de cache do maremo.to
+
+Mantém o cache de páginas do LiteSpeed sempre quente, para que nenhum visitante
+seja o primeiro a montar uma página do zero.
+
+## O problema que ele resolve
+
+Servir uma página já em cache é instantâneo. Montá-la do zero é caro — e quem paga
+esse custo é justamente quem chega primeiro depois de o cache ser esvaziado.
+
+O cache esvazia sozinho em duas situações que não dependem de ninguém lembrar:
+
+- quando o TTL de 7 dias expira;
+- quando um plugin, o tema ou o próprio WordPress é atualizado.
+
+Este workflow garante que, nessas horas, quem monta as páginas seja um robô.
+
+## Como funciona
+
+Duas vezes por dia, lê o `sitemap_index.xml` do site, extrai todas as URLs e visita
+uma a uma. Páginas novas entram sozinhas — não existe lista fixa para manter.
+
+O resumo de cada execução informa quantas páginas estavam frias e quais eram.
+
+## Depois de mexer no site
+
+Editar qualquer coisa no WordPress limpa o cache inteiro. Para reaquecer na hora,
+sem esperar a próxima execução agendada:
+
+**Actions → Aquecer cache do maremo.to → Run workflow**
+
+## Detalhe importante
+
+O cabeçalho `Accept` enviado pelo script anuncia suporte a WebP de propósito.
+O LiteSpeed mantém variantes de cache separadas para navegadores que aceitam WebP
+e para os que não aceitam. Um aquecedor sem esse cabeçalho esquentaria a variante
+que quase ninguém usa, e os visitantes reais continuariam encontrando páginas frias
+— com a falsa impressão de que o aquecimento está funcionando.
