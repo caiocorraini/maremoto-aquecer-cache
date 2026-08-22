@@ -8,12 +8,20 @@ on:
     - cron: '17 9,21 * * *'
   workflow_dispatch:   # botao "Run workflow" para disparar na mao apos editar o site
 
+concurrency:
+  group: aquecer-cache
+  cancel-in-progress: false
+
 jobs:
   aquecer:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Visitar todas as paginas do sitemap
         run: |
+          # O -e vem do shell do GitHub e faria a execucao morrer no primeiro
+          # tropeco de rede, sem dizer o motivo. Aqui os erros sao tratados na mao.
+          set +e
           set -uo pipefail
 
           BASE="https://maremo.to"
@@ -21,49 +29,95 @@ jobs:
           # O Accept precisa anunciar webp: o LiteSpeed guarda uma variante de cache
           # diferente para quem aceita webp. Sem isso, aqueceriamos a variante errada.
           ACCEPT="text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+          # O firewall da hospedagem recusa conexoes quando chegam varias em rajada.
+          # Um segundo de intervalo faz a visita parecer gente, e nao varredura.
+          PAUSA=1
+          TENTATIVAS=5
+
+          # Toda requisicao passa por aqui. --retry-connrefused e --retry-all-errors
+          # cobrem justamente a recusa intermitente do firewall: uma conexao negada
+          # sozinha nao pode mais derrubar a execucao inteira.
+          RETENTAR="--retry $TENTATIVAS --retry-delay 3 --retry-connrefused --retry-all-errors"
+
+          baixar() {   # baixar <url> <arquivo>
+            curl -sS -f -L --connect-timeout 15 --max-time 90 $RETENTAR \
+                 -A "$UA" -H "Accept: $ACCEPT" -o "$2" "$1"
+          }
 
           echo "Lendo o sitemap..."
-          curl -sS -A "$UA" "$BASE/sitemap_index.xml" -o index.xml
+          if ! baixar "$BASE/sitemap_index.xml" index.xml; then
+            echo "::error::Nao consegui baixar o sitemap depois de $TENTATIVAS tentativas."
+            exit 1
+          fi
+
           grep -o '<loc>[^<]*</loc>' index.xml | sed 's|</\?loc>||g' > subsitemaps.txt
+          if [ ! -s subsitemaps.txt ]; then
+            echo "::error::O sitemap veio sem nenhuma URL dentro. Resposta do servidor:"
+            head -c 1000 index.xml; echo
+            exit 1
+          fi
 
           : > urls.txt
+          sitemaps_perdidos=0
           while read -r s; do
-            curl -sS -A "$UA" "$s" | grep -o '<loc>[^<]*</loc>' | sed 's|</\?loc>||g' >> urls.txt
+            if baixar "$s" sub.xml; then
+              grep -o '<loc>[^<]*</loc>' sub.xml | sed 's|</\?loc>||g' >> urls.txt
+            else
+              sitemaps_perdidos=$((sitemaps_perdidos+1))
+              echo "::error::Nao consegui ler o sub-sitemap $s. A lista de paginas ficou incompleta."
+            fi
+            sleep "$PAUSA"
           done < subsitemaps.txt
+
           sort -u urls.txt -o urls.txt
+          if [ ! -s urls.txt ]; then
+            echo "::error::Nenhuma URL para aquecer."
+            exit 1
+          fi
           echo "$(wc -l < urls.txt) URLs encontradas."
           echo
 
-          frias=0; total=0
+          frias=0; erros=0; total=0
           : > relatorio.txt
           while read -r u; do
             total=$((total+1))
-            resp=$(curl -sS -o /dev/null -D - -A "$UA" -H "Accept: $ACCEPT" -w '|%{time_starttransfer}' --max-time 90 "$u")
-            estado=$(printf '%s' "$resp" | grep -i '^x-litespeed-cache:' | tr -d '\r' | awk '{print $2}')
+            resp=$(curl -sS -f -o /dev/null -D - --connect-timeout 15 --max-time 90 $RETENTAR \
+                   -A "$UA" -H "Accept: $ACCEPT" -w '|%{http_code}|%{time_starttransfer}' "$u")
+            rc=$?
+
+            if [ "$rc" != 0 ]; then
+              erros=$((erros+1))
+              printf 'ERRO       -    %s (curl %s)\n' "$u" "$rc" >> relatorio.txt
+              sleep "$PAUSA"
+              continue
+            fi
+
+            estado=$(printf '%s' "$resp" | grep -i '^x-litespeed-cache:' | tr -d '\r' | awk '{print $2}' | tail -1)
             tempo=$(printf '%s' "$resp" | tr -d '\n' | awk -F'|' '{print $NF}')
             case "$estado" in
               *miss*)
                 frias=$((frias+1)); marca="FRIA"
-                # So pausa depois de uma pagina fria, que custou CPU do servidor ao ser
-                # montada. Pagina ja quente sai do cache em 0,07s e nao pesa nada:
-                # esperar entre elas so faria a execucao custar mais minutos do GitHub.
+                # So pausa a mais depois de uma pagina fria, que custou CPU do servidor
+                # ao ser montada. Pagina ja quente sai do cache em 0,07s e nao pesa nada.
                 sleep 2
                 ;;
               *) marca="ok  " ;;
             esac
             printf '%s %7.2fs  %s\n' "$marca" "${tempo:-0}" "$u" >> relatorio.txt
+            sleep "$PAUSA"
           done < urls.txt
 
           echo "=== As mais lentas desta passada ==="
-          sort -k2 -rn relatorio.txt | head -10
+          grep -v '^ERRO' relatorio.txt | sort -k2 -rn | head -10
           echo
-          echo "Total: $total  |  Estavam frias: $frias"
+          echo "Total: $total  |  Estavam frias: $frias  |  Nao responderam: $erros"
 
           {
             echo "### Aquecimento do cache"
             echo ""
             echo "- Paginas verificadas: **$total**"
             echo "- Estavam frias e foram aquecidas agora: **$frias**"
+            [ "$erros" -gt 0 ] && echo "- Nao responderam nem apos $TENTATIVAS tentativas: **$erros**"
             echo ""
             if [ "$frias" -gt 0 ]; then
               echo "Paginas que um visitante teria pego frias:"
@@ -74,4 +128,25 @@ jobs:
             else
               echo "Site estava inteiro quente. Nenhum visitante pagaria pedagio."
             fi
+            if [ "$erros" -gt 0 ]; then
+              echo ""
+              echo "Paginas que o servidor recusou:"
+              echo ""
+              echo '```'
+              grep '^ERRO' relatorio.txt
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Falha isolada de pagina vira aviso; so derruba a execucao se a coleta
+          # ficou incompleta ou se o servidor recusou mais de um terco do site.
+          if [ "$sitemaps_perdidos" -gt 0 ]; then
+            exit 1
+          fi
+          if [ "$erros" -gt 0 ]; then
+            if [ $((erros * 3)) -gt "$total" ]; then
+              echo "::error::$erros de $total paginas nao responderam. O servidor esta recusando conexoes."
+              exit 1
+            fi
+            echo "::warning::$erros de $total paginas nao responderam nesta passada."
+          fi
